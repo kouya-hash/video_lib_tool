@@ -1,0 +1,5 @@
+PySide6>=6.5
+pyinstaller>=6.0
+# EXR サムネイル対応（任意）
+# openimageio
+# numpy
