@@ -193,24 +193,56 @@ def _local_cache_base() -> Path:
     return base
 
 
-def resolve_cache_for_root(root_path: Path) -> Path:
+def resolve_cache_for_root(
+    root_path: Path,
+    server_cache_override: str = "",
+    local_cache_override: str = "",
+) -> tuple[Path, str]:
     """
-    ルートフォルダ直下の .vlt_cache/ に書き込めればサーバー共有キャッシュとして使用。
-    失敗した場合はローカル APPDATA に fallback する。
+    キャッシュディレクトリを決定して返す。戻り値は (cache_path, label)。
+
+    優先順位:
+      1. server_cache_override が指定されていれば、その下に root_hash サブフォルダを作成して使用
+      2. root_path 直下の .vlt_cache/ に書き込めれば使用（共有キャッシュ）
+      3. local_cache_override が指定されていれば使用
+      4. APPDATA/vlt_cache/<root_hash>/ にフォールバック
     """
-    server_cache = root_path / ".vlt_cache"
+    root_hash = hashlib.md5(str(root_path).encode("utf-8")).hexdigest()[:12]
+
+    # 1. 明示的なサーバーキャッシュパス
+    if server_cache_override.strip():
+        p = Path(server_cache_override.strip()) / root_hash
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            test = p / f".write_test_{uuid.uuid4().hex}"
+            test.touch(); test.unlink()
+            return p, "server (custom)"
+        except (PermissionError, OSError):
+            pass  # 書き込み不可なら次の選択肢へ
+
+    # 2. ルート直下の .vlt_cache/（デフォルトの共有キャッシュ）
+    auto_server = root_path / ".vlt_cache"
     try:
-        server_cache.mkdir(parents=True, exist_ok=True)
-        test_file = server_cache / f".write_test_{uuid.uuid4().hex}"
-        test_file.touch()
-        test_file.unlink()
-        return server_cache
+        auto_server.mkdir(parents=True, exist_ok=True)
+        test = auto_server / f".write_test_{uuid.uuid4().hex}"
+        test.touch(); test.unlink()
+        return auto_server, "server (auto)"
     except (PermissionError, OSError):
         pass
-    h = hashlib.md5(str(root_path).encode("utf-8")).hexdigest()[:12]
-    local = _local_cache_base() / h
-    local.mkdir(parents=True, exist_ok=True)
-    return local
+
+    # 3. 明示的なローカルキャッシュパス
+    if local_cache_override.strip():
+        p = Path(local_cache_override.strip()) / root_hash
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p, "local (custom)"
+        except (PermissionError, OSError):
+            pass
+
+    # 4. APPDATA フォールバック
+    p = _local_cache_base() / root_hash
+    p.mkdir(parents=True, exist_ok=True)
+    return p, "local (auto)"
 
 
 def local_settings_dir() -> Path:
@@ -885,6 +917,42 @@ class SettingsDialog(QDialog):
         # Proxy suffixes
         self.proxy_sfx_edit = QLineEdit(", ".join(settings.get("proxy_suffixes", DEFAULT_PROXY_STEM_SUFFIXES)))
 
+        # Cache — server
+        self.cache_server_edit = QLineEdit(settings.get("cache_server_path", ""))
+        self.cache_server_edit.setPlaceholderText("blank = <root>/.vlt_cache/ (auto)")
+        cs_browse = QPushButton("…")
+        cs_browse.setFixedWidth(28)
+        cs_browse.clicked.connect(
+            lambda: self._browse_dir(self.cache_server_edit, "Server Cache Folder")
+        )
+        cs_row = QHBoxLayout()
+        cs_lbl = QLabel("Server Cache Path:")
+        cs_lbl.setFixedWidth(180)
+        cs_row.addWidget(cs_lbl)
+        cs_row.addWidget(self.cache_server_edit, stretch=1)
+        cs_row.addWidget(cs_browse)
+
+        # Cache — local
+        self.cache_local_edit = QLineEdit(settings.get("cache_local_path", ""))
+        self.cache_local_edit.setPlaceholderText("blank = APPDATA/vlt_cache/ (auto)")
+        cl_browse = QPushButton("…")
+        cl_browse.setFixedWidth(28)
+        cl_browse.clicked.connect(
+            lambda: self._browse_dir(self.cache_local_edit, "Local Cache Folder")
+        )
+        cl_row = QHBoxLayout()
+        cl_lbl = QLabel("Local Cache Path:")
+        cl_lbl.setFixedWidth(180)
+        cl_row.addWidget(cl_lbl)
+        cl_row.addWidget(self.cache_local_edit, stretch=1)
+        cl_row.addWidget(cl_browse)
+
+        cache_note = QLabel(
+            "Cache priority: Server Cache Path → <root>/.vlt_cache (auto) → Local Cache Path → APPDATA (auto)"
+        )
+        cache_note.setStyleSheet("color: #777; font-size: 8pt;")
+        cache_note.setWordWrap(True)
+
         ok_btn = QPushButton("Save")
         cancel_btn = QPushButton("Cancel")
         ok_btn.clicked.connect(self.accept)
@@ -894,12 +962,16 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(ok_btn)
         btn_row.addWidget(cancel_btn)
 
+        self.resize(600, 480)
         layout = QVBoxLayout(self)
         layout.addLayout(root_row)
         layout.addLayout(rv_row)
         layout.addLayout(ev_row)
         layout.addLayout(_row("Proxy Subfolders (comma-sep):", self.proxy_sub_edit))
         layout.addLayout(_row("Proxy Stem Suffixes (comma-sep):", self.proxy_sfx_edit))
+        layout.addLayout(cs_row)
+        layout.addLayout(cl_row)
+        layout.addWidget(cache_note)
         layout.addStretch()
         layout.addLayout(btn_row)
 
@@ -913,6 +985,11 @@ class SettingsDialog(QDialog):
         if f:
             edit.setText(f)
 
+    def _browse_dir(self, edit: QLineEdit, caption: str):
+        d = QFileDialog.getExistingDirectory(self, caption, edit.text())
+        if d:
+            edit.setText(d)
+
     def accept(self):
         self._settings["default_root"]    = self.root_edit.text().strip()
         self._settings["rv_path"]         = self.rv_edit.text().strip()
@@ -923,6 +1000,8 @@ class SettingsDialog(QDialog):
         self._settings["proxy_suffixes"] = [
             s.strip() for s in self.proxy_sfx_edit.text().split(",") if s.strip()
         ]
+        self._settings["cache_server_path"] = self.cache_server_edit.text().strip()
+        self._settings["cache_local_path"]  = self.cache_local_edit.text().strip()
         super().accept()
 
     @property
@@ -1249,6 +1328,8 @@ class MainWindow(QMainWindow):
             "proxy_subfolders": DEFAULT_PROXY_SUBFOLDERS,
             "proxy_suffixes": DEFAULT_PROXY_STEM_SUFFIXES,
             "copy_recent_dirs": [],
+            "cache_server_path": "",   # 空白 = ルート直下 .vlt_cache/ に自動作成
+            "cache_local_path":  "",   # 空白 = APPDATA/vlt_cache/<hash>/ に自動作成
         }
         path = local_settings_dir() / "settings.json"
         try:
@@ -1346,7 +1427,11 @@ class MainWindow(QMainWindow):
         self.current_folder = folder_path
 
         # ── キャッシュディレクトリ切り替え ──────────────────────────────────
-        self.cache_root = resolve_cache_for_root(folder_path)
+        self.cache_root, cache_label = resolve_cache_for_root(
+            folder_path,
+            server_cache_override=self._settings.get("cache_server_path", ""),
+            local_cache_override=self._settings.get("cache_local_path", ""),
+        )
         self.thumb_cache_dir = self.cache_root / "thumbs"
         self.hover_cache_dir = self.cache_root / "hover"
         self.nuke_drop_dir   = self.cache_root / "nuke_drop"
@@ -1363,9 +1448,9 @@ class MainWindow(QMainWindow):
         self.scan_current_folder()
 
         # キャッシュ場所をステータスバーに表示
-        server = (self.cache_root == folder_path / ".vlt_cache")
-        loc = "server" if server else "local"
-        self.statusBar().showMessage(f"Root: {folder_path}  |  Cache: {self.cache_root} ({loc})")
+        self.statusBar().showMessage(
+            f"Root: {folder_path}  |  Cache: {self.cache_root}  [{cache_label}]"
+        )
 
     def on_folder_clicked(self, index):
         folder_path = Path(self.folder_model.filePath(index))
